@@ -9,7 +9,6 @@ import sys
 import subprocess
 import platform
 import json
-import shutil
 from pathlib import Path
 
 # Color output for better UX
@@ -291,13 +290,21 @@ def create_pipeline_scripts(base_path):
         "01_fetch_messages.py": '''#!/usr/bin/env python3
 """Fetch messages from Apple Messages database"""
 
-import sys
-import sqlite3
+import importlib.util
 import json
-from pathlib import Path
-import hashlib
+import sqlite3
+import sys
 from datetime import datetime, timezone
-from .00_config import MESSAGES_DB_PATH, OUTPUTS_PATH, JESS_CONTACT_IDENTIFIER
+from pathlib import Path
+
+_scripts = Path(__file__).resolve().parent
+_spec = importlib.util.spec_from_file_location("timeline_00_config", _scripts / "00_config.py")
+_cfg = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_cfg)
+
+MESSAGES_DB_PATH = _cfg.MESSAGES_DB_PATH
+OUTPUTS_PATH = _cfg.OUTPUTS_PATH
+JESS_CONTACT_IDENTIFIER = _cfg.JESS_CONTACT_IDENTIFIER
 
 def connect_messages_db():
     """Connect to the Messages database"""
@@ -392,14 +399,24 @@ if __name__ == "__main__":
         "02_transcribe_messages.py": '''#!/usr/bin/env python3
 """Transcribe audio messages using Whisper"""
 
-import sys
-import json
 import hashlib
+import importlib.util
+import json
 import sqlite3
+import sys
 from pathlib import Path
+
 from faster_whisper import WhisperModel
-from .00_config import (OUTPUTS_PATH, TRANSCRIPTION_CACHE_DB, 
-                       WHISPER_MODEL, TRANSCRIPTION_ENGINE)
+
+_scripts = Path(__file__).resolve().parent
+_spec = importlib.util.spec_from_file_location("timeline_00_config", _scripts / "00_config.py")
+_cfg = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_cfg)
+
+OUTPUTS_PATH = _cfg.OUTPUTS_PATH
+TRANSCRIPTION_CACHE_DB = _cfg.TRANSCRIPTION_CACHE_DB
+WHISPER_MODEL = _cfg.WHISPER_MODEL
+TRANSCRIPTION_ENGINE = _cfg.TRANSCRIPTION_ENGINE
 
 class TranscriptionManager:
     def __init__(self):
@@ -477,14 +494,14 @@ class TranscriptionManager:
         if cached:
             return cached
         
-        # Transcribe using Whisper
+        # Transcribe using Whisper (segments is a generator; materialize before multiple passes)
         segments, info = self.model.transcribe(audio_path)
+        segments = list(segments)
         
         transcript = ""
         for segment in segments:
             transcript += segment.text + " "
         
-        # Get duration
         duration = sum(segment.end for segment in segments)
         
         # Cache the result
@@ -554,11 +571,20 @@ if __name__ == "__main__":
         "06_merge_outputs.py": '''#!/usr/bin/env python3
 """Merge all event sources into unified timeline"""
 
+import importlib.util
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime
-from .00_config import OUTPUTS_PATH, UNIFIED_JSON, UNIFIED_MD
+
+_scripts = Path(__file__).resolve().parent
+_spec = importlib.util.spec_from_file_location("timeline_00_config", _scripts / "00_config.py")
+_cfg = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_cfg)
+
+OUTPUTS_PATH = _cfg.OUTPUTS_PATH
+UNIFIED_JSON = _cfg.UNIFIED_JSON
+UNIFIED_MD = _cfg.UNIFIED_MD
 
 def load_jsonl(file_path):
     """Load JSONL file into list of events"""
@@ -577,7 +603,7 @@ def sort_events(events):
         timestamp_str = event.get('timestamp')
         if timestamp_str:
             return datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-        return datetime.min
+        return datetime.min.replace(tzinfo=timezone.utc)
     
     return sorted(events, key=get_timestamp)
 
@@ -730,7 +756,13 @@ def create_launchd_plist(base_path):
     """Create launchd plist for auto-update"""
     print_step(8, "Creating Auto-Update Configuration")
     
-    plist_content = '''<?xml version="1.0" encoding="UTF-8"?>
+    root = base_path.resolve()
+    scripts_dir = root / "scripts"
+    logs_dir = root / "logs"
+    wrapper_sh = scripts_dir / "run_timeline_update.sh"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    
+    plist_content = f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -740,21 +772,20 @@ def create_launchd_plist(base_path):
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>-c</string>
-        <string>cd "$(dirname "$0")" && ./run_timeline_update.sh</string>
+        <string>{wrapper_sh}</string>
     </array>
     
     <key>WorkingDirectory</key>
-    <string>/Users/$USER/unified_timeline/scripts</string>
+    <string>{scripts_dir}</string>
     
     <key>StartInterval</key>
-    <integer>900</integer>  <!-- Run every 15 minutes -->
+    <integer>900</integer>
     
     <key>StandardOutPath</key>
-    <string>/Users/$USER/unified_timeline/logs/timeline.log</string>
+    <string>{logs_dir / "timeline.log"}</string>
     
     <key>StandardErrorPath</key>
-    <string>/Users/$USER/unified_timeline/logs/timeline_error.log</string>
+    <string>{logs_dir / "timeline_error.log"}</string>
     
     <key>RunAtLoad</key>
     <true/>
@@ -774,9 +805,9 @@ def create_launchd_plist(base_path):
     
     print_success(f"Created launchd plist: {plist_path.name}")
     print(f"To enable auto-update, run:")
-    print(f"  launchctl load {plist_path}")
+    print(f"  launchctl load {plist_path.resolve()}")
     print(f"To disable auto-update, run:")
-    print(f"  launchctl unload {plist_path}")
+    print(f"  launchctl unload {plist_path.resolve()}")
 
 def create_readme(base_path):
     """Create comprehensive README"""
@@ -803,26 +834,170 @@ A comprehensive system for creating a unified timeline of all communications wit
    ./run_timeline_update.sh
    ```
 
-2. **Enable scheduled updates** (optional): load the generated `com.yourname.unified-timeline.plist` with `launchctl` as printed by the setup script.
+2. **Enable auto-updates:**
+   ```bash
+   launchctl load ../com.yourname.unified-timeline.plist
+   ```
 
-## Project layout
+3. **View the results:**
+   ```bash
+   open ../data/outputs/
+   ```
 
-- `scripts/` — pipeline steps and `run_timeline_update.sh`
-- `data/outputs/` — merged JSON/Markdown/HTML
-- `inputs/Takeout/` — place Google Takeout exports here when using those sources
-- `logs/` — launchd and pipeline logs
+## Project Structure
 
-## Requirements
-
-- macOS, Python 3.11+, and dependencies from `requirements.txt`
-- Access to your Messages database (Full Disk Access may be required for `chat.db`)
+```
+unified_jess_timeline/
+├── com.yourname.unified-timeline.plist   # launchd (project root)
+├── scripts/                              # Pipeline scripts
+│   ├── 00_config.py                      # Configuration
+│   ├── 01_fetch_messages.py              # Fetch Messages data
+│   ├── 02_transcribe_messages.py         # Transcribe audio
+│   ├── 06_merge_outputs.py               # Merge all sources
+│   └── run_timeline_update.sh            # Pipeline wrapper
+├── data/
+│   ├── cache/                            # Transcription cache
+│   └── outputs/                          # Final timeline outputs
+├── inputs/
+│   └── Takeout/                          # Google Takeout files
+└── logs/                                 # Pipeline logs
+```
 
 ## Configuration
 
-Edit `scripts/00_config.py` (created during setup) for paths, contact identifier, and model settings.
+Edit `scripts/00_config.py` to customize:
+- Paths to Takeout data
+- Messages database location
+- Contact identifier for filtering
+- Transcription settings
+
+## Pipeline Steps
+
+1. **Fetch Messages**: Extracts messages and attachments from Apple Messages database
+2. **Transcribe Audio**: Converts audio attachments to text using Whisper
+3. **Parse Voice** (optional): Processes Google Voice data
+4. **Parse Chat** (optional): Processes Google Chat data
+5. **Parse Alexa** (optional): Processes Alexa voice data
+6. **Merge**: Combines all sources into unified timeline
+
+## Outputs
+
+- `unified_jess_timeline.json`: Complete timeline in JSON format
+- `unified_jess_timeline.md`: Human-readable timeline in Markdown
+- `unified_jess_timeline.html`: Web-viewable timeline (if generated)
+
+## Troubleshooting
+
+### Database Access Issues
+If you can't access the Messages database:
+1. Ensure Messages is closed
+2. Check permissions: `ls -la ~/Library/Messages/chat.db`
+
+### Transcription Issues
+If transcription fails:
+1. Check audio file permissions
+2. Verify sufficient disk space
+3. Try a smaller Whisper model in config
+
+### Performance
+- Initial run may take 1-2 hours for 1,200 audio files
+- Use SSD storage for best performance
+- Consider upgrading to faster-whisper with GPU
+
+## Data Privacy
+
+- All processing is done locally on your Mac
+- No data is sent to external services
+- Transcription cache is stored locally in SQLite
+
+## Manual Updates
+
+To run pipeline manually:
+```bash
+cd scripts/
+./run_timeline_update.sh
+```
+
+To update just messages:
+```bash
+python3 01_fetch_messages.py
+python3 02_transcribe_messages.py
+python3 06_merge_outputs.py
+```
+
+## Log Files
+
+Check logs for pipeline status:
+- `../logs/timeline.log` - Standard output
+- `../logs/timeline_error.log` - Error logs
+
+## License
+
+This tool is for personal use only. Respect privacy and data protection laws.
 '''
     
     readme_path = base_path / "README.md"
     with open(readme_path, 'w') as f:
         f.write(readme_content)
-    print_success(f"Created documentation: {readme_path.name}")
+    print_success(f"Created README: {readme_path.name}")
+
+
+def create_git_keep_files(base_path):
+    """Create .gitkeep files for empty directories"""
+    print_step(10, "Creating .gitkeep Files")
+    
+    keep_paths = [
+        base_path / "data" / "cache" / ".gitkeep",
+        base_path / "data" / "outputs" / ".gitkeep",
+        base_path / "inputs" / "Takeout" / ".gitkeep",
+    ]
+    
+    for keep_path in keep_paths:
+        keep_path.parent.mkdir(parents=True, exist_ok=True)
+        keep_path.touch()
+        print_success(f"Created {keep_path}")
+
+
+def print_final_instructions(base_path):
+    """Print final setup instructions"""
+    print_step(11, "Setup Complete!")
+    
+    print(f"\n{Colors.HEADER}{Colors.BOLD}Unified Jess Timeline is ready!{Colors.ENDC}")
+    
+    print(f"\n{Colors.OKGREEN}Next steps:{Colors.ENDC}")
+    print(f"1. Place your Google Takeout files in: {base_path}/inputs/Takeout/")
+    print(f"2. Run the pipeline: cd {base_path}/scripts/ && ./run_timeline_update.sh")
+    print(f"3. Enable auto-updates: launchctl load {base_path.resolve()}/com.yourname.unified-timeline.plist")
+    print(f"4. View results in: {base_path}/data/outputs/")
+    
+    print(f"\n{Colors.OKCYAN}Important notes:{Colors.ENDC}")
+    print("- Make sure Messages is closed before running fetch_messages.py")
+    print("- First run may take 1-2 hours for transcription")
+    print("- Check logs in: logs/ directory")
+    
+    print(f"\n{Colors.BOLD}Files created in: {base_path.resolve()}{Colors.ENDC}")
+
+
+def main():
+    """Main setup function"""
+    print(f"{Colors.HEADER}{Colors.BOLD}")
+    print("=" * 60)
+    print("  UNIFIED JESS TIMELINE SETUP")
+    print("=" * 60)
+    print(f"{Colors.ENDC}")
+    
+    check_dependencies()
+    install_python_packages()
+    base_path = create_directory_structure()
+    create_config_file(base_path)
+    create_utility_scripts(base_path)
+    create_pipeline_scripts(base_path)
+    create_wrapper_script(base_path)
+    create_launchd_plist(base_path)
+    create_readme(base_path)
+    create_git_keep_files(base_path)
+    print_final_instructions(base_path)
+
+
+if __name__ == "__main__":
+    main()
