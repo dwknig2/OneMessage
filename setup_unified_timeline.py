@@ -157,6 +157,8 @@ def create_config_file(base_path):
     if not messages_db_path:
         messages_db_path = str(Path.home() / "Library" / "Messages" / "chat.db")
     
+    ios_backup_path = input(f"{Colors.OKCYAN}Enter path to an iPhone backup or sms.db for iOS integration (optional, press Enter to skip):{Colors.ENDC} ").strip()
+    
     jess_contact = input(f"{Colors.OKCYAN}Enter Jess's contact identifier (name, number, or email):{Colors.ENDC} ").strip()
     
     # Create config file
@@ -171,6 +173,11 @@ from pathlib import Path
 TAKEOUT_BASE_PATH = "{takeout_path}"
 MESSAGES_DB_PATH = "{messages_db_path}"
 JESS_CONTACT_IDENTIFIER = "{jess_contact}"
+
+# iOS Integration
+# Point at either a full iPhone backup directory (containing Manifest.db) or a
+# raw sms.db file. Leave empty to disable the iOS backup stage.
+IOS_BACKUP_PATH = "{ios_backup_path}"
 
 # Project Paths
 BASE_PATH = Path(__file__).parent.parent
@@ -189,6 +196,7 @@ TRANSCRIPTION_CACHE_DB = CACHE_PATH / "transcriptions.db"
 UNIFIED_JSON = OUTPUTS_PATH / "unified_jess_timeline.json"
 UNIFIED_MD = OUTPUTS_PATH / "unified_jess_timeline.md"
 UNIFIED_HTML = OUTPUTS_PATH / "unified_jess_timeline.html"
+IOS_EVENTS = OUTPUTS_PATH / "ios_events.jsonl"
 
 # Timeline Settings
 BATCH_SIZE = 100  # Process messages in batches
@@ -568,6 +576,180 @@ if __name__ == "__main__":
     main()
 ''',
 
+        "01b_fetch_ios_backup.py": '''#!/usr/bin/env python3
+"""Fetch messages from an iPhone backup (or a raw sms.db).
+
+iOS sandboxes app data, so there is no on-device API to read Messages. The
+supported route is to parse an iTunes/Finder (or libimobiledevice) device
+backup, whose sms.db shares the same schema as the macOS chat.db. This stage
+resolves sms.db from the backup's Manifest.db and emits unified timeline events.
+"""
+
+import importlib.util
+import json
+import sqlite3
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+_scripts = Path(__file__).resolve().parent
+_spec = importlib.util.spec_from_file_location("timeline_00_config", _scripts / "00_config.py")
+_cfg = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_cfg)
+
+IOS_BACKUP_PATH = _cfg.IOS_BACKUP_PATH
+OUTPUTS_PATH = _cfg.OUTPUTS_PATH
+IOS_EVENTS = _cfg.IOS_EVENTS
+JESS_CONTACT_IDENTIFIER = _cfg.JESS_CONTACT_IDENTIFIER
+
+# Seconds between the Unix epoch (1970) and the Apple/Cocoa epoch (2001).
+APPLE_EPOCH_OFFSET = 978307200
+
+
+def apple_time_to_iso(raw):
+    """Convert a Messages timestamp to ISO 8601 UTC.
+
+    Modern iOS/macOS store the value in nanoseconds since 2001-01-01; older
+    databases store seconds. Detect which by magnitude.
+    """
+    if raw is None:
+        return None
+    raw = int(raw)
+    seconds = raw / 1_000_000_000 if abs(raw) > 1_000_000_000_000 else raw
+    unix = seconds + APPLE_EPOCH_OFFSET
+    return datetime.fromtimestamp(unix, tz=timezone.utc).isoformat()
+
+
+def _resolve_from_manifest(manifest_path):
+    """Look up Library/SMS/sms.db in a backup Manifest.db and return its path."""
+    conn = sqlite3.connect(str(manifest_path))
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT fileID FROM Files WHERE domain = 'HomeDomain' "
+        "AND relativePath = 'Library/SMS/sms.db'"
+    )
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        raise FileNotFoundError("sms.db not found in backup Manifest.db")
+
+    file_id = row[0]
+    backup_dir = manifest_path.parent
+
+    # iOS 10+ store files under a two-character prefix directory; older
+    # backups use a flat layout.
+    for candidate in (backup_dir / file_id[:2] / file_id, backup_dir / file_id):
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(f"Resolved sms.db fileID {file_id} but the file is missing")
+
+
+def resolve_sms_db(backup_path):
+    """Accept a backup directory, a Manifest.db, or a raw sms.db and return sms.db."""
+    path = Path(backup_path).expanduser()
+
+    if path.is_file():
+        if path.name == "Manifest.db":
+            return _resolve_from_manifest(path)
+        return path  # assume a raw sms.db
+
+    manifest = path / "Manifest.db"
+    if manifest.exists():
+        return _resolve_from_manifest(manifest)
+
+    raise FileNotFoundError(f"No sms.db or Manifest.db found at {backup_path}")
+
+
+def fetch_ios_messages(sms_db):
+    """Read messages (and attachment metadata) from an sms.db."""
+    conn = sqlite3.connect(str(sms_db))
+    cursor = conn.cursor()
+
+    query = """
+    SELECT
+        m.ROWID as message_id,
+        m.text,
+        m.date as timestamp,
+        m.is_from_me,
+        h.id as handle,
+        a.ROWID as attachment_id,
+        a.filename,
+        a.mime_type,
+        a.total_bytes
+    FROM message m
+    LEFT JOIN handle h ON m.handle_id = h.ROWID
+    LEFT JOIN message_attachment_join maj ON m.ROWID = maj.message_id
+    LEFT JOIN attachment a ON maj.attachment_id = a.ROWID
+    WHERE m.text IS NOT NULL OR a.ROWID IS NOT NULL
+    ORDER BY m.date ASC
+    """
+
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    conn.close()
+
+    messages = {}
+
+    for row in rows:
+        (message_id, text, timestamp, is_from_me, handle,
+         attachment_id, filename, mime_type, total_bytes) = row
+
+        # Optionally narrow received messages to the configured contact.
+        if JESS_CONTACT_IDENTIFIER and not is_from_me and handle:
+            if JESS_CONTACT_IDENTIFIER not in handle:
+                continue
+
+        if message_id not in messages:
+            messages[message_id] = {
+                'id': f"ios-{message_id}",
+                'source': 'ios_messages',
+                'text': text or '',
+                'timestamp': apple_time_to_iso(timestamp),
+                'is_from_me': bool(is_from_me),
+                'sender': "Me" if is_from_me else (handle or "Unknown"),
+                'attachments': []
+            }
+
+        if attachment_id and filename:
+            messages[message_id]['attachments'].append({
+                'id': f"ios-att-{attachment_id}",
+                'filename': filename,
+                'mime_type': mime_type,
+                'size': total_bytes,
+            })
+
+    return list(messages.values())
+
+
+def main():
+    """Main function"""
+    if not IOS_BACKUP_PATH:
+        print("IOS_BACKUP_PATH is not configured; skipping iOS backup stage.")
+        return
+
+    try:
+        sms_db = resolve_sms_db(IOS_BACKUP_PATH)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    print(f"Reading iOS messages from {sms_db}")
+    events = fetch_ios_messages(sms_db)
+
+    IOS_EVENTS.parent.mkdir(parents=True, exist_ok=True)
+    with open(IOS_EVENTS, 'w') as f:
+        for event in events:
+            f.write(json.dumps(event) + '\\n')
+
+    print(f"Fetched {len(events)} iOS messages to {IOS_EVENTS}")
+
+
+if __name__ == "__main__":
+    main()
+''',
+
         "06_merge_outputs.py": '''#!/usr/bin/env python3
 """Merge all event sources into unified timeline"""
 
@@ -676,12 +858,13 @@ def main():
     
     # Load all event sources
     messages_events = load_jsonl(OUTPUTS_PATH / "messages_enriched.jsonl")
+    ios_events = load_jsonl(OUTPUTS_PATH / "ios_events.jsonl")
     voice_events = load_jsonl(OUTPUTS_PATH / "voice_events.jsonl")
     chat_events = load_jsonl(OUTPUTS_PATH / "chat_events.jsonl")
     alexa_events = load_jsonl(OUTPUTS_PATH / "alexa_events.jsonl")
     
     # Combine all events
-    all_events = messages_events + voice_events + chat_events + alexa_events
+    all_events = messages_events + ios_events + voice_events + chat_events + alexa_events
     
     # Sort by timestamp
     all_events = sort_events(all_events)
@@ -724,6 +907,9 @@ cd "$(dirname "$0")"
 # Run each step of the pipeline
 echo "Step 1: Fetching messages..."
 python3 01_fetch_messages.py
+
+echo "Step 1b: Fetching iOS backup messages (skipped if IOS_BACKUP_PATH is unset)..."
+python3 01b_fetch_ios_backup.py
 
 echo "Step 2: Transcribing audio..."
 python3 02_transcribe_messages.py
@@ -820,6 +1006,7 @@ A comprehensive system for creating a unified timeline of all communications wit
 ## Features
 
 - ✅ **Apple Messages**: Fetches and transcribes audio from Messages
+- ✅ **iOS backup**: Parses an iPhone backup's sms.db (or a raw sms.db) for iOS messages
 - 🔄 **Google Voice**: Parses text threads and voicemail transcripts
 - 🔄 **Google Chat**: Processes chat messages (when data available)
 - 🔄 **Alexa**: Handles Alexa voice data (when export available)
@@ -852,6 +1039,7 @@ unified_jess_timeline/
 ├── scripts/                              # Pipeline scripts
 │   ├── 00_config.py                      # Configuration
 │   ├── 01_fetch_messages.py              # Fetch Messages data
+│   ├── 01b_fetch_ios_backup.py           # Fetch messages from an iPhone backup
 │   ├── 02_transcribe_messages.py         # Transcribe audio
 │   ├── 06_merge_outputs.py               # Merge all sources
 │   └── run_timeline_update.sh            # Pipeline wrapper
@@ -874,6 +1062,7 @@ Edit `scripts/00_config.py` to customize:
 ## Pipeline Steps
 
 1. **Fetch Messages**: Extracts messages and attachments from Apple Messages database
+1b. **Fetch iOS Backup** (optional): Resolves and parses sms.db from an iPhone backup
 2. **Transcribe Audio**: Converts audio attachments to text using Whisper
 3. **Parse Voice** (optional): Processes Google Voice data
 4. **Parse Chat** (optional): Processes Google Chat data
