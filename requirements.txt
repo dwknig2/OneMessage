@@ -1,0 +1,12 @@
+# Python dependencies for the Unified Jess Timeline pipeline.
+# These mirror the packages installed by setup_unified_timeline.py
+# (sqlite3 is part of the Python standard library and is intentionally omitted).
+typer[all]
+beautifulsoup4
+lxml
+ijson
+faster-whisper
+orjson
+jinja2
+fastapi
+uvicorn[standard]

@@ -1,0 +1,4 @@
+{
+  "name": "OneMessage",
+  "install": "bash .cursor/install.sh"
+}

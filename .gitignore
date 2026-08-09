@@ -1,3 +1,10 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Virtual environments
+.venv/
+venv/
+
+# Generated pipeline scaffold / outputs
+unified_jess_timeline/
