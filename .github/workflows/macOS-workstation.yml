@@ -1,5 +1,4 @@
-#yaml
-name: macOS Remote Workstation
+#YAMLname: macOS Remote Workstation
 
 on:
   workflow_dispatch:
@@ -38,27 +37,32 @@ jobs:
 
       - name: Enable SSH & macOS Screen Sharing (VNC)
         run: |
-          # Set password for the 'runner' user
-          sudo dscl . -passwd /Users/runner "${{ secrets.RUNNER_PASSWORD }}"
+          # 1. Create a dedicated admin user for VNC/SSH (avoids 'runner' old-password prompt)
+          sudo sysadminctl -addUser vncuser -fullName "VNC User" -password "${{ secrets.RUNNER_PASSWORD }}" -admin
 
-          # Enable SSH (Remote Login)
+          # 2. Enable SSH (Remote Login)
           sudo systemsetup -setremotelogin on
 
-          # Enable macOS Screen Sharing (VNC) & Remote Management
+          # 3. Enable macOS Screen Sharing & write XOR-hashed VNC password directly
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -activate -configure -access -on \
-            -clientopts -setvnclegacy -vnclegacy yes \
-            -clientopts -setvncpw -vncpw "${{ secrets.RUNNER_PASSWORD }}" \
-            -restart -agent -privs -all
+            -activate -configure -access -on -allowAccessFor -allUsers -privs -all -restart -agent
+
+          echo "${{ secrets.RUNNER_PASSWORD }}" | perl -we '
+            BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA" };
+            $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_;
+            foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"
+          ' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt > /dev/null
+
+          sudo chmod 600 /Library/Preferences/com.apple.VNCSettings.txt
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -restart -agent
 
           echo "=========================================="
           echo "Tailscale Hostname: mac-${{ github.event.repository.name }}"
           echo "VNC Address: vnc://mac-${{ github.event.repository.name }}:5900"
-          echo "SSH Command: ssh runner@mac-${{ github.event.repository.name }}"
+          echo "SSH Command: ssh vncuser@mac-${{ github.event.repository.name }}"
           echo "=========================================="
-
-      - name: Keep Workstation Alive
-        run: |
+          - name: Keep Workstation Alive
+          run: |
           DURATION=$(( ${{ github.event.inputs.duration_minutes }} * 60 ))
           END_TIME=$(( $(date +%s) + DURATION ))
           
