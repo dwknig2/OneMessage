@@ -1,5 +1,4 @@
 #YAMLname: macOS Remote Workstation
-
 on:
   workflow_dispatch:
     inputs:
@@ -37,7 +36,7 @@ jobs:
 
       - name: Enable SSH & macOS Screen Sharing (VNC)
         run: |
-          # 1. Create a dedicated admin user for VNC/SSH (avoids 'runner' old-password prompt)
+          # 1. Create a dedicated admin user for VNC/SSH
           sudo sysadminctl -addUser vncuser -fullName "VNC User" -password "${{ secrets.RUNNER_PASSWORD }}" -admin
 
           # 2. Enable SSH (Remote Login)
@@ -61,6 +60,28 @@ jobs:
           echo "VNC Address: vnc://mac-${{ github.event.repository.name }}:5900"
           echo "SSH Command: ssh vncuser@mac-${{ github.event.repository.name }}"
           echo "=========================================="
+
+      - name: Diagnose macOS Desktop
+        run: |
+          echo "=== Console User ==="
+          stat -f '%Su' /dev/console
+
+          echo "=== GUI Processes ==="
+          pgrep -fl \
+            'WindowServer|loginwindow|Finder|screensharingd|ARDAgent' || true
+
+          echo "=== VNC Service ==="
+          sudo launchctl print \
+            system/com.apple.screensharing 2>&1 | head -40
+
+          echo "=== VNC User GUI Session ==="
+          UID_VNC=$(id -u vncuser)
+          if sudo launchctl print \
+            "gui/$UID_VNC" >/dev/null 2>&1; then
+            echo "GUI domain exists"
+          else
+            echo "No GUI domain for vncuser"
+          fi
 
       - name: Keep Workstation Alive
         run: |
