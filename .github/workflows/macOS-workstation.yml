@@ -1,11 +1,9 @@
-#YAML
-
 name: macOS Remote Workstation
 on:
   workflow_dispatch:
     inputs:
       duration_minutes:
-        description: 'Session timeout in minutes (max 350)'
+        description: 'Session timeout (minutes, max 350)'
         required: true
         default: '180'
         type: string
@@ -15,9 +13,9 @@ on:
         default: 'macos-latest'
         type: choice
         options:
-          - macos-latest # Apple Silicon (M1/M2)
-          - macos-15     # Apple Silicon (macOS Sequoia)
-          - macos-13     # Intel x86_64
+          - macos-latest
+          - macos-15
+          - macos-13
 
 jobs:
   workstation:
@@ -25,65 +23,34 @@ jobs:
     timeout-minutes: 355
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
-          hostname: mac-${{ github.event.repository.name }}
+          hostname: mac-${{ github.run_id }}
 
-      - name: Enable SSH & macOS Screen Sharing (VNC)
+      - name: Enable SSH & Screen Sharing (VNC)
         run: |
-          # 1. Create a dedicated admin user for VNC/SSH
-          sudo sysadminctl -addUser vncuser -fullName "VNC User" -password "${{ secrets.RUNNER_PASSWORD }}" -admin
+          # 1. Set a password for the default 'runner' user so Screens 5 & SSH can log in
+          sudo sysadminctl -resetPassword -user runner -password "${{ secrets.RUNNER_PASSWORD }}"
 
-          # 2. Enable SSH (Remote Login)
-          sudo systemsetup -setremotelogin on
+          # 2. Enable SSH
+          sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist
 
-          # 3. Enable macOS Screen Sharing & write XOR-hashed VNC password directly
+          # 3. Enable Screen Sharing (VNC) and allow all users
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -activate -configure -access -on -allowAccessFor -allUsers -privs -all -restart -agent
+            -activate -configure -access -on -allowAccessFor -allUsers -privs -all
 
-          echo "${{ secrets.RUNNER_PASSWORD }}" | perl -we '
-            BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA" };
-            $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_;
-            foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"
-          ' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt > /dev/null
-
-          sudo chmod 600 /Library/Preferences/com.apple.VNCSettings.txt
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -restart -agent
-
+          # 4. Keep the virtual display awake so Screens 5 doesn't see a black screen
+          caffeinate -u -t 2 &
+          
           echo "=========================================="
-          echo "Tailscale Hostname: mac-${{ github.event.repository.name }}"
-          echo "VNC Address: vnc://mac-${{ github.event.repository.name }}:5900"
-          echo "SSH Command: ssh vncuser@mac-${{ github.event.repository.name }}"
+          echo "Tailscale Hostname: mac-${{ github.run_id }}"
+          echo "VNC Address: mac-${{ github.run_id }}:5900"
+          echo "SSH Command: ssh runner@mac-${{ github.run_id }}"
           echo "=========================================="
-
-      - name: Diagnose macOS Desktop
-        run: |
-          echo "=== Console User ==="
-          stat -f '%Su' /dev/console
-
-          echo "=== GUI Processes ==="
-          pgrep -fl \
-            'WindowServer|loginwindow|Finder|screensharingd|ARDAgent' || true
-
-          echo "=== VNC Service ==="
-          sudo launchctl print \
-            system/com.apple.screensharing 2>&1 | head -40
-
-          echo "=== VNC User GUI Session ==="
-          UID_VNC=$(id -u vncuser)
-          if sudo launchctl print \
-            "gui/$UID_VNC" >/dev/null 2>&1; then
-            echo "GUI domain exists"
-          else
-            echo "No GUI domain for vncuser"
-          fi
 
       - name: Keep Workstation Alive
         run: |
