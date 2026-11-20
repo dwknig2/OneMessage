@@ -1,4 +1,6 @@
-#YAMLname: macOS Remote Workstation
+#YAML
+
+name: macOS Remote Workstation
 on:
   workflow_dispatch:
     inputs:
