@@ -43,7 +43,7 @@ jobs:
           sw_vers
           uname -m
           id runner
-          printf 'Console owner: '; ijîstat -f '%Su' /dev/console
+          printf 'Console owner: '; stat -f '%Su' /dev/console
           pgrep -fl 'WindowServer|loginwindow|screensharingd|ARDAgent' || true
           sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || true
 
