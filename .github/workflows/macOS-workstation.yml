@@ -34,7 +34,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo tailscale up --ssh
+          sudo tailscale up --ssh --accept-routes --advertise-tags=tag:ci --hostname=mac-${{ github.run_id }}
           printf 'Console owner: '; stat -f '%Su' /dev/console
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -activate -configure -access -on -allowAccessFor -allUsers -privs -all
           sudo lsof -nP -iTCP:5900 -sTCP:LISTEN
