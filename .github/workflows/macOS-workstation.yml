@@ -1,6 +1,12 @@
 name: macOS Remote Workstation
 on:
   workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'Session duration (1–350 minutes)'
+        required: true
+        default: '180'
+        type: string
 permissions:
   contents: read
 jobs:
@@ -8,6 +14,15 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 355
     steps:
+      - name: Validate duration
+        id: session
+        env:
+          MINUTES: ${{ inputs.duration_minutes }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$MINUTES" =~ ^[0-9]+$ ]] && (( MINUTES >= 1 && MINUTES <= 350 )) || { echo 'Duration must be 1–350 minutes'; exit 1; }
+          echo "seconds=$(( MINUTES * 60 ))" >> "$GITHUB_OUTPUT"
       - name: Connect Tailscale
         uses: tailscale/github-action@v4
         with:
@@ -15,32 +30,28 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
           hostname: mac-${{ github.run_id }}
-      - name: Configure Screen Sharing
+      - name: Enable Tailscale SSH and Screen Sharing
         shell: bash
         run: |
           set -euo pipefail
+          sudo tailscale set --ssh
           printf 'Console owner: '; stat -f '%Su' /dev/console
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -activate -configure -access -on -allowAccessFor -allUsers -privs -all
-          sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || true
-          echo 'Screens host: mac-${{ github.run_id }}:5900'
-      - name: Start authenticated interactive tmate session
-        shell: bash
+          sudo lsof -nP -iTCP:5900 -sTCP:LISTEN
+          echo 'Screens: mac-${{ github.run_id }}:5900 (visible in Screens tailnet integration)'
+          echo 'Terminal: ssh runner@mac-${{ github.run_id }} (requires tailnet SSH policy)'
+          echo 'From SSH, create admin interactively: sudo sysadminctl -addUser screensadmin -admin -password -'
+      - name: Keep workstation alive
         env:
-          ACTOR: ${{ github.actor }}
+          SECONDS_TO_RUN: ${{ steps.session.outputs.seconds }}
+        shell: bash
         run: |
           set -euo pipefail
-          brew install tmate
-          curl -fsSL "https://github.com/${ACTOR}.keys" -o /tmp/workstation-authorized-keys
-          [[ -s /tmp/workstation-authorized-keys ]] || { echo 'No GitHub SSH key for triggering actor'; exit 1; }
-          nohup caffeinate -dimsu -t 21000 >/tmp/caffeinate.log 2>&1 </dev/null &
-          tmate -S /tmp/workstation.sock -a /tmp/workstation-authorized-keys new-session -d
-          tmate -S /tmp/workstation.sock wait tmate-ready
-          echo 'SSH with your GitHub SSH key:'
-          tmate -S /tmp/workstation.sock display -p '#{tmate_ssh}'
-          echo 'In tmate, create an admin user; type its password at the prompt:'
-          echo 'sudo sysadminctl -addUser screensadmin -admin -password -'
-          echo 'Then connect Screens as screensadmin on port 5900. Cancel the run when done.'
-          while tmate -S /tmp/workstation.sock has-session 2>/dev/null; do
+          caffeinate -dimsu -t "$SECONDS_TO_RUN" &
+          CAFFEINATE_PID=$!
+          trap 'kill "$CAFFEINATE_PID" 2>/dev/null || true' EXIT
+          end=$(( $(date +%s) + SECONDS_TO_RUN ))
+          while (( $(date +%s) < end )); do
             [[ ! -f /tmp/stop ]] || break
             sleep 10
           done
