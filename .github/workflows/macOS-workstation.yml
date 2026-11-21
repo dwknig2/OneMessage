@@ -1,34 +1,13 @@
-name: macOS Remote Workstation (diagnostic draft)
-
+name: macOS Remote Workstation
 on:
   workflow_dispatch:
-    inputs:
-      duration_minutes:
-        description: 'Session duration, 1–350 minutes'
-        required: true
-        default: '180'
-        type: string
-
 permissions:
   contents: read
-
 jobs:
   workstation:
     runs-on: macos-15
     timeout-minutes: 355
     steps:
-      - name: Validate inputs and credentials
-        id: settings
-        env:
-          REQUESTED_MINUTES: ${{ inputs.duration_minutes }}
-          RUNNER_PASSWORD: ${{ secrets.RUNNER_PASSWORD }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$REQUESTED_MINUTES" =~ ^[0-9]+$ ]] && (( REQUESTED_MINUTES >= 1 && REQUESTED_MINUTES <= 350 )) || { echo 'duration_minutes must be 1–350'; exit 1; }
-          [[ -n "$RUNNER_PASSWORD" ]] || { echo 'RUNNER_PASSWORD secret is missing'; exit 1; }
-          echo "seconds=$(( REQUESTED_MINUTES * 60 ))" >> "$GITHUB_OUTPUT"
-
       - name: Connect Tailscale
         uses: tailscale/github-action@v4
         with:
@@ -36,59 +15,23 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
           hostname: mac-${{ github.run_id }}
-
-      - name: Diagnose desktop before changes
+      - name: Configure Screen Sharing
         shell: bash
         run: |
-          sw_vers
-          uname -m
-          id runner
+          set -euo pipefail
           printf 'Console owner: '; stat -f '%Su' /dev/console
-          pgrep -fl 'WindowServer|loginwindow|screensharingd|ARDAgent' || true
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -activate -configure -access -on -allowAccessFor -allUsers -privs -all
           sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || true
-
-      - name: Configure runner account and Apple Screen Sharing
-        env:
-          RUNNER_PASSWORD: ${{ secrets.RUNNER_PASSWORD }}
+          echo 'Screens host: mac-${{ github.run_id }}:5900'
+      - name: Keep display awake
         shell: bash
         run: |
-          set -euo pipefail
-          # The hosted image already provides an administrator account named runner.
-          id runner
-          sudo sysadminctl -resetPassword -user runner -newPassword "$RUNNER_PASSWORD"
-          sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -activate -configure -access -on -allowAccessFor -allUsers -privs -all
-          # Let the desktop service settle; don't restart launchd or the login session.
-          for attempt in {1..12}; do
-            if sudo lsof -nP -iTCP:5900 -sTCP:LISTEN; then break; fi
-            sleep 5
-          done
-          printf 'Console owner after setup: '; stat -f '%Su' /dev/console
-          pgrep -fl 'WindowServer|loginwindow|screensharingd|ARDAgent' || true
-          echo "Screens: mac-${{ github.run_id }}:5900 (macOS user: runner)"
-          echo "SSH: ssh runner@mac-${{ github.run_id }}"
-
-      - name: Keep workstation alive
-        env:
-          DURATION_SECONDS: ${{ steps.settings.outputs.seconds }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          caffeinate -dimsu -t "$DURATION_SECONDS" &
-          CAFFEINATE_PID=$!
-          trap 'kill "$CAFFEINATE_PID" 2>/dev/null || true' EXIT
-          end=$(( $(date +%s) + DURATION_SECONDS ))
-          while (( $(date +%s) < end )); do
-            if [[ -f /tmp/stop ]]; then echo 'Stop requested'; break; fi
-            if ! kill -0 "$CAFFEINATE_PID" 2>/dev/null; then echo 'caffeinate exited'; fi
-            sleep 10
-          done
-
-      # If the native display still shows black, temporarily enable this step
-      # BEFORE Keep workstation alive. It blocks until you exit tmate; inspect
-      # the console and GUI session there. Do not share its connection URL.
-      # - name: Debug interactively with tmate
-      #   uses: mxschmitt/action-tmate@v3
-      #   with:
-      #     limit-access-to-actor: true
+          nohup caffeinate -dimsu -t 21000 >/tmp/caffeinate.log 2>&1 </dev/null &
+          echo 'In tmate, create an admin account interactively:'
+          echo 'sudo sysadminctl -addUser screensadmin -admin -password -'
+          echo 'Enter the password at the terminal prompt, not in the workflow log.'
+          echo 'Connect Screens as screensadmin; cancel this run when finished.'
+      - name: Interactive tmate session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
