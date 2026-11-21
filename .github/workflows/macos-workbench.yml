@@ -1,0 +1,173 @@
+
+name: macOS On-Demand Workbench
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Interactive session length (10–330 minutes)"
+        required: true
+        default: "90"
+        type: string
+      runner_arch:
+        description: "macOS image (Apple Silicon by default)"
+        required: true
+        default: macos-15
+        type: choice
+        options:
+          - macos-15
+          - macos-26
+          - macos-15-intel
+          - macos-26-intel
+      try_vnc:
+        description: "Experiment with Screens 5 / native VNC (may show black screen)"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-workbench-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  workstation:
+    runs-on: ${{ inputs.runner_arch }}
+    timeout-minutes: 355
+    env:
+      SESSION_MINUTES: ${{ inputs.duration_minutes }}
+      TRY_VNC: ${{ inputs.try_vnc }}
+      WORKBENCH_HOST: mac-${{ github.run_id }}
+
+    steps:
+      - name: Validate session parameters
+        shell: bash
+        run: |
+          if ! [[ "$SESSION_MINUTES" =~ ^[0-9]+$ ]] ||
+             (( SESSION_MINUTES < 10 || SESSION_MINUTES > 330 )); then
+            echo "duration_minutes must be an integer from 10 through 330."
+            exit 1
+          fi
+
+      - name: Check out project
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Join private Tailscale network
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: ${{ env.WORKBENCH_HOST }}
+
+      - name: Configure SSH workbench account
+        shell: bash
+        env:
+          RUNNER_PASSWORD: ${{ secrets.RUNNER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$RUNNER_PASSWORD" ]]; then
+            echo "Missing GitHub Actions secret RUNNER_PASSWORD."
+            exit 1
+          fi
+          if ! id vncuser >/dev/null 2>&1; then
+            sudo sysadminctl -addUser vncuser \
+              -fullName "Remote Workbench" \
+              -password "$RUNNER_PASSWORD" -admin
+          fi
+          sudo systemsetup -setremotelogin on
+          echo "SSH account vncuser is configured."
+
+          # The GitHub runner account owns GITHUB_WORKSPACE, so copy a
+          # credential-free, writable checkout into the SSH user's home.
+          dest=/Users/vncuser/workbench
+          sudo mkdir -p "$dest"
+          sudo rsync -a "$GITHUB_WORKSPACE/" "$dest/"
+          sudo chown -R vncuser:staff "$dest"
+          echo "Writable project checkout: $dest"
+
+      - name: Optionally try native Screen Sharing
+        if: ${{ inputs.try_vnc }}
+        shell: bash
+        run: |
+          KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          if sudo "$KICKSTART" \
+              -activate -configure -access -on \
+              -allowAccessFor -specifiedUsers \
+              -users vncuser -privs -all \
+              -restart -agent; then
+            echo "Apple Remote Desktop service configured for vncuser."
+          else
+            echo "WARNING: Remote Desktop configuration failed. SSH remains available."
+          fi
+          echo "No legacy 8-character VNC password was configured."
+          echo "In Screens 5 use Mac User authentication: vncuser + RUNNER_PASSWORD."
+          echo "Mac screen capture/control authorization may still be blocked on CI runners."
+
+      - name: Capture workbench diagnostics
+        shell: bash
+        run: |
+          {
+            echo "### Runner diagnostics"
+            echo '```text'
+            printf 'OS: '; sw_vers -productVersion
+            printf 'Architecture: '; uname -m
+            printf 'Console account: '; stat -f '%Su' /dev/console
+            echo "Graphical processes:"
+            pgrep -fl 'WindowServer|loginwindow|Finder|screensharingd|ARDAgent' || true
+            echo "GUI launchd domain for vncuser:"
+            vnc_uid="$(id -u vncuser)"
+            if sudo launchctl print "gui/$vnc_uid" >/dev/null 2>&1; then
+              echo "exists (does not prove an active desktop login)"
+            else
+              echo "absent"
+            fi
+            echo "Screen Sharing launchd service:"
+            sudo launchctl print system/com.apple.screensharing 2>&1 | head -30 || true
+            echo "VNC port 5900:"
+            lsof -nP -iTCP:5900 -sTCP:LISTEN || true
+            echo "Xcode version:"
+            xcodebuild -version 2>&1 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Print connection details
+        shell: bash
+        run: |
+          ip="$(tailscale ip -4 | head -1)"
+          if [[ -z "$ip" ]]; then
+            echo "No Tailscale IPv4 address discovered."
+            exit 1
+          fi
+          {
+            echo "## Workbench connection"
+            echo "Tailscale name: **$WORKBENCH_HOST**"
+            echo "Tailscale IPv4: **$ip**"
+            echo "Writable project folder: **/Users/vncuser/workbench**"
+            echo '```bash'
+            echo "ssh vncuser@$ip"
+            echo '```'
+            if [[ "$TRY_VNC" == "true" ]]; then
+              echo "Screens 5: address **$ip**, port **5900**, Mac User **vncuser**."
+              echo "Use your existing RUNNER_PASSWORD secret as the Mac account password."
+              echo "If the result is a black screen, this is a macOS GUI/capture limitation; use SSH."
+            fi
+            echo 'Stop session: `touch /tmp/stop-workbench` (over SSH), or cancel the run.'
+            echo "This workbench copy has no saved GitHub token. Authenticate with gh auth login before pushing."
+            echo "Files on this runner are destroyed when the job ends; commit/push or export anything needed."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep workbench active
+        shell: bash
+        run: |
+          set -euo pipefail
+          end=$(( SECONDS + SESSION_MINUTES * 60 ))
+          echo "Workbench is active for up to $SESSION_MINUTES minutes."
+          while (( SECONDS < end )) && [[ ! -e /tmp/stop-workbench ]]; do
+            sleep 10
+          done
+          echo "Workbench session completed."
