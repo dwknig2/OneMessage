@@ -23,15 +23,24 @@ jobs:
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -activate -configure -access -on -allowAccessFor -allUsers -privs -all
           sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || true
           echo 'Screens host: mac-${{ github.run_id }}:5900'
-      - name: Keep display awake
+      - name: Start authenticated interactive tmate session
         shell: bash
+        env:
+          ACTOR: ${{ github.actor }}
         run: |
+          set -euo pipefail
+          brew install tmate
+          curl -fsSL "https://github.com/${ACTOR}.keys" -o /tmp/workstation-authorized-keys
+          [[ -s /tmp/workstation-authorized-keys ]] || { echo 'No GitHub SSH key for triggering actor'; exit 1; }
           nohup caffeinate -dimsu -t 21000 >/tmp/caffeinate.log 2>&1 </dev/null &
-          echo 'In tmate, create an admin account interactively:'
+          tmate -S /tmp/workstation.sock -a /tmp/workstation-authorized-keys new-session -d
+          tmate -S /tmp/workstation.sock wait tmate-ready
+          echo 'SSH with your GitHub SSH key:'
+          tmate -S /tmp/workstation.sock display -p '#{tmate_ssh}'
+          echo 'In tmate, create an admin user; type its password at the prompt:'
           echo 'sudo sysadminctl -addUser screensadmin -admin -password -'
-          echo 'Enter the password at the terminal prompt, not in the workflow log.'
-          echo 'Connect Screens as screensadmin; cancel this run when finished.'
-      - name: Interactive tmate session
-        uses: mxschmitt/action-tmate@v3
-        with:
-          limit-access-to-actor: true
+          echo 'Then connect Screens as screensadmin on port 5900. Cancel the run when done.'
+          while tmate -S /tmp/workstation.sock has-session 2>/dev/null; do
+            [[ ! -f /tmp/stop ]] || break
+            sleep 10
+          done
