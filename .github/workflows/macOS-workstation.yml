@@ -1,29 +1,35 @@
-name: macOS Remote Workstation
+name: macOS Remote Workstation (diagnostic draft)
+
 on:
   workflow_dispatch:
     inputs:
       duration_minutes:
-        description: 'Session timeout (minutes, max 350)'
+        description: 'Session duration, 1–350 minutes'
         required: true
         default: '180'
         type: string
-      runner_arch:
-        description: 'macOS Runner Architecture'
-        required: true
-        default: 'macos-latest'
-        type: choice
-        options:
-          - macos-latest
-          - macos-15
-          - macos-13
+
+permissions:
+  contents: read
 
 jobs:
   workstation:
-    runs-on: ${{ github.event.inputs.runner_arch }}
+    runs-on: macos-15
     timeout-minutes: 355
-
     steps:
-      - name: Connect to Tailscale
+      - name: Validate inputs and credentials
+        id: settings
+        env:
+          REQUESTED_MINUTES: ${{ inputs.duration_minutes }}
+          RUNNER_PASSWORD: ${{ secrets.RUNNER_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$REQUESTED_MINUTES" =~ ^[0-9]+$ ]] && (( REQUESTED_MINUTES >= 1 && REQUESTED_MINUTES <= 350 )) || { echo 'duration_minutes must be 1–350'; exit 1; }
+          [[ -n "$RUNNER_PASSWORD" ]] || { echo 'RUNNER_PASSWORD secret is missing'; exit 1; }
+          echo "seconds=$(( REQUESTED_MINUTES * 60 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Connect Tailscale
         uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
@@ -31,35 +37,58 @@ jobs:
           tags: tag:ci
           hostname: mac-${{ github.run_id }}
 
-      - name: Enable SSH & Screen Sharing (VNC)
+      - name: Diagnose desktop before changes
+        shell: bash
         run: |
-          # 1. Set a password for the default 'runner' user so Screens 5 & SSH can log in
-          sudo sysadminctl -resetPassword -user runner -password "${{ secrets.RUNNER_PASSWORD }}"
+          sw_vers
+          uname -m
+          id runner
+          printf 'Console owner: '; ijîstat -f '%Su' /dev/console
+          pgrep -fl 'WindowServer|loginwindow|screensharingd|ARDAgent' || true
+          sudo lsof -nP -iTCP:5900 -sTCP:LISTEN || true
 
-          # 2. Enable SSH
+      - name: Configure runner account and Apple Screen Sharing
+        env:
+          RUNNER_PASSWORD: ${{ secrets.RUNNER_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The hosted image already provides an administrator account named runner.
+          id runner
+          sudo sysadminctl -resetPassword -user runner -newPassword "$RUNNER_PASSWORD"
           sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist
-
-          # 3. Enable Screen Sharing (VNC) and allow all users
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -access -on -allowAccessFor -allUsers -privs -all
+          # Let the desktop service settle; don't restart launchd or the login session.
+          for attempt in {1..12}; do
+            if sudo lsof -nP -iTCP:5900 -sTCP:LISTEN; then break; fi
+            sleep 5
+          done
+          printf 'Console owner after setup: '; stat -f '%Su' /dev/console
+          pgrep -fl 'WindowServer|loginwindow|screensharingd|ARDAgent' || true
+          echo "Screens: mac-${{ github.run_id }}:5900 (macOS user: runner)"
+          echo "SSH: ssh runner@mac-${{ github.run_id }}"
 
-          # 4. Keep the virtual display awake so Screens 5 doesn't see a black screen
-          caffeinate -u -t 2 &
-          
-          echo "=========================================="
-          echo "Tailscale Hostname: mac-${{ github.run_id }}"
-          echo "VNC Address: mac-${{ github.run_id }}:5900"
-          echo "SSH Command: ssh runner@mac-${{ github.run_id }}"
-          echo "=========================================="
-
-      - name: Keep Workstation Alive
+      - name: Keep workstation alive
+        env:
+          DURATION_SECONDS: ${{ steps.settings.outputs.seconds }}
+        shell: bash
         run: |
-          DURATION=$(( ${{ github.event.inputs.duration_minutes }} * 60 ))
-          END_TIME=$(( $(date +%s) + DURATION ))
-          
-          echo "Session active for ${{ github.event.inputs.duration_minutes }} minutes."
-          echo "To end early, run 'touch /tmp/stop' in SSH or cancel the workflow in GitHub."
-          
-          while [ $(date +%s) -lt $END_TIME ] && [ ! -f /tmp/stop ]; do
+          set -euo pipefail
+          caffeinate -dimsu -t "$DURATION_SECONDS" &
+          CAFFEINATE_PID=$!
+          trap 'kill "$CAFFEINATE_PID" 2>/dev/null || true' EXIT
+          end=$(( $(date +%s) + DURATION_SECONDS ))
+          while (( $(date +%s) < end )); do
+            if [[ -f /tmp/stop ]]; then echo 'Stop requested'; break; fi
+            if ! kill -0 "$CAFFEINATE_PID" 2>/dev/null; then echo 'caffeinate exited'; fi
             sleep 10
           done
+
+      # If the native display still shows black, temporarily enable this step
+      # BEFORE Keep workstation alive. It blocks until you exit tmate; inspect
+      # the console and GUI session there. Do not share its connection URL.
+      # - name: Debug interactively with tmate
+      #   uses: mxschmitt/action-tmate@v3
+      #   with:
+      #     limit-access-to-actor: true
