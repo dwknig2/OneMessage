@@ -1,0 +1,216 @@
+name: Build zsign.wasm with holzschu wasi-sdk
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+env:
+  WASI_SDK_PATH: /tmp/wasi-sdk-install
+  WASI_DEPS_PATH: /tmp/wasi-deps
+  WASI_SHIMS_PATH: /tmp/wasi-shims
+  OPENSSL_VER: 3.3.2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build perl make curl git
+
+      - name: Checkout zsign
+        uses: actions/checkout@v4
+        with:
+          repository: zhlynn/zsign
+          path: zsign
+
+      - name: Checkout holzschu wasi-sdk and compute cache key
+        id: sdk_src
+        run: |
+          git clone --recursive https://github.com/holzschu/wasi-sdk.git /tmp/holzschu-wasi-sdk
+          if [ -d /tmp/holzschu-wasi-sdk/src/wasi-libc ]; then
+            git -C /tmp/holzschu-wasi-sdk/src/wasi-libc remote add holzschu https://github.com/holzschu/wasi-libc.git || true
+            git -C /tmp/holzschu-wasi-sdk/src/wasi-libc fetch holzschu || true
+          fi
+          SDK_REV=$(git -C /tmp/holzschu-wasi-sdk rev-parse HEAD)
+          LIBC_REV=$(git -C /tmp/holzschu-wasi-sdk/src/wasi-libc rev-parse HEAD 2>/dev/null || echo "none")
+          echo "cache_fingerprint=${SDK_REV}-${LIBC_REV}-openssl-${OPENSSL_VER}" >> $GITHUB_OUTPUT
+
+      - name: Cache holzschu wasi-sdk and wasi-deps
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/wasi-sdk-install
+            /tmp/wasi-deps
+          key: wasi-holzschu-wasip1-${{ runner.os }}-${{ steps.sdk_src.outputs.cache_fingerprint }}
+          restore-keys: |
+            wasi-holzschu-wasip1-${{ runner.os }}-
+
+      - name: Build holzschu wasi-sdk toolchain and sysroot
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cd /tmp/holzschu-wasi-sdk
+          cmake -G Ninja -B build/toolchain -S . \
+            -DWASI_SDK_BUILD_TOOLCHAIN=ON \
+            -DCMAKE_INSTALL_PREFIX="${WASI_SDK_PATH}"
+          cmake --build build/toolchain --target install
+
+          cmake -G Ninja -B build/sysroot -S . \
+            -DWASI_SDK_BUILD_TOOLCHAIN=OFF \
+            -DWASI_SDK_TARGETS=wasm32-wasip1 \
+            -DCMAKE_INSTALL_PREFIX="${WASI_SDK_PATH}" \
+            -DWASI_SDK_INSTALL_TO_CLANG_RESOURCE_DIR=ON
+          cmake --build build/sysroot --target install
+
+      - name: Build zlib for wasm32-wasip1
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          curl -sSL "https://zlib.net/current/zlib.tar.gz" | tar -xz -C /tmp
+          cd /tmp/zlib-*
+          CC="${WASI_SDK_PATH}/bin/clang" \
+          AR="${WASI_SDK_PATH}/bin/llvm-ar" \
+          RANLIB="${WASI_SDK_PATH}/bin/llvm-ranlib" \
+          CFLAGS="-O2" \
+          ./configure --static --prefix="${WASI_DEPS_PATH}"
+          make -j"$(nproc)" && make install
+
+      - name: Build static OpenSSL for wasm32-wasip1
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          curl -sSL "https://www.openssl.org/source/openssl-${OPENSSL_VER}.tar.gz" | tar -xz -C /tmp
+          cd "/tmp/openssl-${OPENSSL_VER}"
+          CC="${WASI_SDK_PATH}/bin/clang" \
+          AR="${WASI_SDK_PATH}/bin/llvm-ar" \
+          RANLIB="${WASI_SDK_PATH}/bin/llvm-ranlib" \
+          ./Configure no-asm no-shared no-threads no-tests no-ui-console no-sock no-dso no-engine \
+            --prefix="${WASI_DEPS_PATH}" \
+            --openssldir="${WASI_DEPS_PATH}/ssl" \
+            linux-generic32 \
+            "-target wasm32-wasip1 --sysroot=${WASI_SDK_PATH}/share/wasi-sysroot -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID"
+          make -j"$(nproc)" build_libs && make install_dev
+
+      - name: Apply WASI shims and patches to zsign
+        run: |
+          mkdir -p "${WASI_SHIMS_PATH}/sys" "${WASI_SHIMS_PATH}/netinet" "${WASI_SHIMS_PATH}/arpa"
+
+          # Stub socket/network headers absent in wasm32-wasip1
+          cat << 'EOF' > "${WASI_SHIMS_PATH}/sys/socket.h"
+          #pragma once
+          #include <sys/types.h>
+          #define AF_INET 2
+          #define AF_INET6 10
+          #define SOCK_STREAM 1
+          #define SOCK_DGRAM 2
+          #define SOL_SOCKET 1
+          #define SO_REUSEADDR 2
+          struct sockaddr { unsigned short sa_family; char sa_data[14]; };
+          typedef unsigned int socklen_t;
+          static inline int socket(int, int, int) { return -1; }
+          static inline int connect(int, const struct sockaddr*, socklen_t) { return -1; }
+          static inline int setsockopt(int, int, int, const void*, socklen_t) { return -1; }
+          EOF
+
+          cat << 'EOF' > "${WASI_SHIMS_PATH}/netinet/in.h"
+          #pragma once
+          #include <stdint.h>
+          #include <sys/socket.h>
+          typedef uint16_t in_port_t;
+          typedef uint32_t in_addr_t;
+          struct in_addr { in_addr_t s_addr; };
+          struct sockaddr_in {
+            unsigned short sin_family;
+            in_port_t sin_port;
+            struct in_addr sin_addr;
+            char sin_zero[8];
+          };
+          static inline uint32_t htonl(uint32_t x) {
+            return ((x & 0xff000000u) >> 24) | ((x & 0x00ff0000u) >> 8) |
+                   ((x & 0x0000ff00u) << 8)  | ((x & 0x000000ffu) << 24);
+          }
+          static inline uint16_t htons(uint16_t x) {
+            return (uint16_t)(((x & 0xff00u) >> 8) | ((x & 0x00ffu) << 8));
+          }
+          static inline uint32_t ntohl(uint32_t x) { return htonl(x); }
+          static inline uint16_t ntohs(uint16_t x) { return htons(x); }
+          EOF
+
+          cat << 'EOF' > "${WASI_SHIMS_PATH}/arpa/inet.h"
+          #pragma once
+          #include <netinet/in.h>
+          static inline const char* inet_ntoa(struct in_addr) { return "0.0.0.0"; }
+          static inline int inet_pton(int, const char*, void*) { return 0; }
+          EOF
+
+          cat << 'EOF' > "${WASI_SHIMS_PATH}/netdb.h"
+          #pragma once
+          #include <netinet/in.h>
+          struct hostent { char* h_name; int h_addrtype; int h_length; char** h_addr_list; };
+          struct addrinfo { int ai_family; int ai_socktype; int ai_protocol; struct sockaddr* ai_addr; struct addrinfo* ai_next; };
+          static inline struct hostent* gethostbyname(const char*) { return 0; }
+          static inline int getaddrinfo(const char*, const char*, const struct addrinfo*, struct addrinfo**) { return -1; }
+          static inline void freeaddrinfo(struct addrinfo*) {}
+          EOF
+
+          # WASI C++ shim providing arc4random / arc4random_uniform
+          cat << 'EOF' > "${WASI_SHIMS_PATH}/wasi_arc4random.hpp"
+          #pragma once
+          #if defined(__wasi__)
+          #include <stdint.h>
+          #include <random>
+
+          extern "C" {
+          static inline uint32_t arc4random(void) {
+            static thread_local std::mt19937 rng([]() {
+              std::random_device rd;
+              return rd();
+            }());
+            return rng();
+          }
+
+          static inline uint32_t arc4random_uniform(uint32_t upper_bound) {
+            if (upper_bound < 2) return 0;
+            uint32_t min = (uint32_t)(-upper_bound) % upper_bound;
+            for (;;) {
+              uint32_t r = arc4random();
+              if (r >= min) return r % upper_bound;
+            }
+          }
+          }
+          #endif
+          EOF
+
+          # Force-include the arc4random shim in C++ compilation units on WASI
+          # and guard any direct arc4random declarations if present in zsign sources
+          python3 - << 'PY'
+          import pathlib
+
+          root = pathlib.Path("zsign/src")
+          for path in root.rglob("*.cpp"):
+              text = path.read_text(encoding="utf-8", errors="ignore")
+              if "arc4random" in text and "wasi_arc4random.hpp" not in text:
+                  path.write_text('#include "wasi_arc4random.hpp"\n' + text, encoding="utf-8")
+          PY
+
+      - name: Compile zsign.wasm
+        run: |
+          cd zsign
+          SRCS=$(find src -name '*.cpp')
+          "${WASI_SDK_PATH}/bin/clang++" \
+            --target=wasm32-wasip1 \
+            --sysroot="${WASI_SDK_PATH}/share/wasi-sysroot" \
+            -std=c++17 -O2 \
+            -include "${WASI_SHIMS_PATH}/wasi_arc4random.hpp" \
+            -Isrc -I"${WASI_SHIMS_PATH}" -I"${WASI_DEPS_PATH}/include" \
+            ${SRCS} \
+            "${WASI_DEPS_PATH}/lib/libssl.a" \
+            "${WASI_DEPS_PATH}/lib/libcrypto.a" \
+            "${WASI_DEPS_PATH}/lib/libz.a" \
+            -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid \
+            -o /tmp/zsign.wasm
+
+      - name: Upload zsign.wasm
+        uses: actions/upload-artifact@v4
+        with:
+          name: zsign-wasm-holzschu
+          path: /tmp/zsign.wasm
