@@ -35,7 +35,7 @@ jobs:
         run: |
           # Bump the relevant recipe version after changing that stage's flags.
           host="holzschu-ubuntu24-${RUNNER_ARCH}-${SDK_REV}-host1"
-          root="${host}-${TARGET}-nolto-noexceptions-root1"
+          root="${host}-${TARGET}-nolto-noexceptions-root2"
           echo "host=$host" >> "$GITHUB_OUTPUT"
           echo "root=$root" >> "$GITHUB_OUTPUT"
           echo "ssl=${root}-openssl-${OPENSSL_REV}-ssl1" >> "$GITHUB_OUTPUT"
@@ -100,6 +100,20 @@ jobs:
       - name: Build Preview 1 sysroot with the installed Clang
         if: steps.root.outputs.cache-hit != 'true'
         run: |
+          # Use the staged WASI public headers and Clang's stddef.h, as upstream does.
+          git -C sdk-src/src/wasi-libc apply - <<'PATCH'
+          diff --git a/libc-top-half/CMakeLists.txt b/libc-top-half/CMakeLists.txt
+          --- a/libc-top-half/CMakeLists.txt
+          +++ b/libc-top-half/CMakeLists.txt
+          @@ -21,7 +21,6 @@
+           # libraries below.
+           add_library(musl-top-half-interface INTERFACE)
+           target_include_directories(musl-top-half-interface INTERFACE
+          -  musl/include
+             musl/src/include
+             musl/src/internal
+             musl/arch/wasm32
+          PATCH
           cmake -G Ninja -S sdk-src -B "$RUNNER_TEMP/build-root" \
             -DCMAKE_TOOLCHAIN_FILE="$WASI_SDK_PATH/share/cmake/wasi-sdk-p1.cmake" \
             -DCMAKE_C_COMPILER_WORKS=ON -DCMAKE_CXX_COMPILER_WORKS=ON \
