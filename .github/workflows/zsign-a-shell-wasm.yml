@@ -318,6 +318,8 @@ jobs:
 
       - name: Validate module and exercise signing on a copied fixture
         run: |
+          export SMOKE_ROOT="$(mktemp -d "$RUNNER_TEMP/zsign-smoke.XXXXXX")"
+          mkdir "$SMOKE_ROOT/tmp"
           node --input-type=commonjs <<'JS'
           const fs = require('node:fs');
           const { WASI } = require('node:wasi');
@@ -330,7 +332,7 @@ jobs:
           if (!WebAssembly.Module.exports(signer).some(x => x.name === '_start'))
             throw Error('Missing WASI command entry point');
           function run(module, args) {
-            const wasi = new WASI({version:'preview1', args, preopens:{'.':process.cwd()}, returnOnExit:true});
+            const wasi = new WASI({version:'preview1', args, preopens:{'/':process.env.SMOKE_ROOT}, returnOnExit:true});
             const code = wasi.start(new WebAssembly.Instance(module, {wasi_snapshot_preview1:wasi.wasiImport}));
             if (code !== 0) throw Error(args.join(' ') + ' exited ' + code);
           }
@@ -345,9 +347,10 @@ jobs:
             run(rand, ['rand-probe']);
             run(signer, ['zsign','-v']);
             const fixture = 'zsign/test/dylib/bin/demo1.dylib';
-            fs.copyFileSync(fixture, 'smoke.dylib');
-            run(signer, ['zsign','-a','-f','-b','org.example.wasismoke','smoke.dylib']);
-            const signed = fs.readFileSync('smoke.dylib');
+            const copy = process.env.SMOKE_ROOT + '/smoke.dylib';
+            fs.copyFileSync(fixture, copy);
+            run(signer, ['zsign','-a','-f','-b','org.example.wasismoke','/smoke.dylib']);
+            const signed = fs.readFileSync(copy);
             if (signed.equals(fs.readFileSync(fixture))) throw Error('Signed bytes did not change');
             if (!signed.includes(Buffer.from('org.example.wasismoke\0'))) throw Error('Missing signing identifier');
             status = 'WASI entropy, CLI startup, and ad-hoc Mach-O writeback passed under Node.';
@@ -356,8 +359,8 @@ jobs:
           fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, status + '\n');
           fs.writeFileSync('dist/validation.txt', status + '\n');
           JS
-          if [[ -f smoke.dylib ]]; then
-            python3 - smoke.dylib <<'PY'
+          if [[ -f "$SMOKE_ROOT/smoke.dylib" ]]; then
+            python3 - "$SMOKE_ROOT/smoke.dylib" <<'PY'
           # Verify each CodeDirectory's executable-page hashes in the arm64 smoke fixture.
           import hashlib
           import struct
