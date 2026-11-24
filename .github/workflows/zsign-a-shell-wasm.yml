@@ -1,216 +1,382 @@
-name: Build zsign.wasm with holzschu wasi-sdk
+name: zsign for a-Shell
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [main]
+    paths: ['.github/workflows/zsign-a-shell-wasm.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zsign-ashell-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
+  SDK_REV: 3d2154daab00d4479d855a661355566b2e393702
+  ZSIGN_REV: 9299685bab7ef99827e06e5dfda93af747386590
+  OPENSSL_REV: 45e844fa2a14ec92d146bd8f5778ac130b6625fb # openssl-3.5.9
   WASI_SDK_PATH: /tmp/wasi-sdk-install
-  WASI_DEPS_PATH: /tmp/wasi-deps
-  WASI_SHIMS_PATH: /tmp/wasi-shims
-  OPENSSL_VER: 3.3.2
+  SSL_PREFIX: /tmp/wasi-openssl
+  TARGET: wasm32-wasip1
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
     steps:
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build perl make curl git
+      - name: Compute reusable cache keys
+        id: keys
+        run: |
+          # Bump the relevant recipe version after changing that stage's flags.
+          host="holzschu-ubuntu24-${RUNNER_ARCH}-${SDK_REV}-host1"
+          root="${host}-${TARGET}-nolto-noexceptions-root1"
+          echo "host=$host" >> "$GITHUB_OUTPUT"
+          echo "root=$root" >> "$GITHUB_OUTPUT"
+          echo "ssl=${root}-openssl-${OPENSSL_REV}-ssl1" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout zsign
+      - name: Restore host compiler
+        id: host
+        uses: actions/cache/restore@v4
+        with:
+          key: ${{ steps.keys.outputs.host }}
+          path: /tmp/wasi-sdk-install
+
+      - name: Restore sysroot overlay
+        id: root
+        uses: actions/cache/restore@v4
+        with:
+          key: ${{ steps.keys.outputs.root }}
+          path: /tmp/wasi-overlay
+
+      - name: Check out SDK and pinned submodules only on a miss
+        if: steps.host.outputs.cache-hit != 'true' || steps.root.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: holzschu/wasi-sdk
+          ref: ${{ env.SDK_REV }}
+          path: sdk-src
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Build host compiler
+        if: steps.host.outputs.cache-hit != 'true'
+        run: |
+          cmake -G Ninja -S sdk-src -B "$RUNNER_TEMP/build-host" \
+            -DWASI_SDK_BUILD_TOOLCHAIN=ON -DCMAKE_INSTALL_PREFIX="$WASI_SDK_PATH"
+          cmake --build "$RUNNER_TEMP/build-host" --target install
+          "$WASI_SDK_PATH/bin/clang" --version
+          rm -rf "$RUNNER_TEMP/build-host"
+
+      - name: Save host compiler immediately
+        if: steps.host.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ steps.keys.outputs.host }}
+          path: /tmp/wasi-sdk-install
+
+      - name: Build Preview 1 sysroot with the installed Clang
+        if: steps.root.outputs.cache-hit != 'true'
+        run: |
+          cmake -G Ninja -S sdk-src -B "$RUNNER_TEMP/build-root" \
+            -DCMAKE_TOOLCHAIN_FILE="$WASI_SDK_PATH/share/cmake/wasi-sdk-p1.cmake" \
+            -DCMAKE_C_COMPILER_WORKS=ON -DCMAKE_CXX_COMPILER_WORKS=ON \
+            -DCMAKE_INSTALL_PREFIX="$WASI_SDK_PATH" -DWASI_SDK_BUILD_TOOLCHAIN=OFF \
+            -DWASI_SDK_TARGETS="$TARGET" -DWASI_SDK_LTO=OFF -DWASI_SDK_EXCEPTIONS=OFF \
+            -DWASI_SDK_INSTALL_TO_CLANG_RESOURCE_DIR=ON
+          cmake --build "$RUNNER_TEMP/build-root"
+          DESTDIR=/tmp/wasi-overlay cmake --install "$RUNNER_TEMP/build-root"
+          rm -rf "$RUNNER_TEMP/build-root"
+
+      - name: Assemble SDK and link a C++ probe
+        run: |
+          cp -a "/tmp/wasi-overlay${WASI_SDK_PATH}/." "$WASI_SDK_PATH/"
+          printf '#include <string>\nint main(int n,char** v){return std::string(v[0]).empty();}\n' |
+            "$WASI_SDK_PATH/bin/clang++" --target="$TARGET" -fno-exceptions \
+              -x c++ - -o "$RUNNER_TEMP/cxx-probe.wasm"
+
+      - name: Save validated sysroot overlay
+        if: steps.root.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ steps.keys.outputs.root }}
+          path: /tmp/wasi-overlay
+
+      - name: Restore static OpenSSL
+        id: ssl
+        uses: actions/cache/restore@v4
+        with:
+          key: ${{ steps.keys.outputs.ssl }}
+          path: /tmp/wasi-openssl
+
+      - name: Check out OpenSSL on a miss
+        if: steps.ssl.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: openssl/openssl
+          ref: ${{ env.OPENSSL_REV }}
+          path: ssl-src
+          persist-credentials: false
+
+      - name: Build OpenSSL with WASI entropy and built-in providers
+        if: steps.ssl.outputs.cache-hit != 'true'
+        working-directory: ssl-src
+        run: |
+          export CC="$WASI_SDK_PATH/bin/clang" AR="$WASI_SDK_PATH/bin/llvm-ar"
+          export RANLIB="$WASI_SDK_PATH/bin/llvm-ranlib"
+          ./Configure gcc --prefix="$SSL_PREFIX" --libdir=lib \
+            --with-rand-seed=getrandom no-asm no-shared no-module no-threads no-tests \
+            no-ui-console no-sock no-dgram no-dso no-engine no-afalgeng no-async \
+            "--target=$TARGET" -O2 -DNO_SYSLOG -DNO_CHMOD -D_WASI_EMULATED_SIGNAL \
+            -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID -D_WASI_EMULATED_MMAN
+          make -j"$(nproc)" build_libs
+          make install_dev
+
+      - name: Confirm target OpenSSL links
+        run: |
+          printf '#include <openssl/rand.h>\nint main(void){unsigned char b;return RAND_bytes(&b,1)!=1;}\n' |
+            "$WASI_SDK_PATH/bin/clang" --target="$TARGET" -I"$SSL_PREFIX/include" \
+              -x c - -x none "$SSL_PREFIX/lib/libcrypto.a" -lwasi-emulated-signal \
+              -lwasi-emulated-process-clocks -lwasi-emulated-getpid -lwasi-emulated-mman \
+              -o "$RUNNER_TEMP/rand-probe.wasm"
+
+      - name: Save OpenSSL before compiling zsign
+        if: steps.ssl.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ steps.keys.outputs.ssl }}
+          path: /tmp/wasi-openssl
+
+      - name: Check out zsign
         uses: actions/checkout@v4
         with:
           repository: zhlynn/zsign
+          ref: ${{ env.ZSIGN_REV }}
           path: zsign
+          persist-credentials: false
 
-      - name: Checkout holzschu wasi-sdk and compute cache key
-        id: sdk_src
+      - name: Adapt pinned zsign sources for offline signing
+        working-directory: zsign
         run: |
-          git clone --recursive https://github.com/holzschu/wasi-sdk.git /tmp/holzschu-wasi-sdk
-          if [ -d /tmp/holzschu-wasi-sdk/src/wasi-libc ]; then
-            git -C /tmp/holzschu-wasi-sdk/src/wasi-libc remote add holzschu https://github.com/holzschu/wasi-libc.git || true
-            git -C /tmp/holzschu-wasi-sdk/src/wasi-libc fetch holzschu || true
-          fi
-          SDK_REV=$(git -C /tmp/holzschu-wasi-sdk rev-parse HEAD)
-          LIBC_REV=$(git -C /tmp/holzschu-wasi-sdk/src/wasi-libc rev-parse HEAD 2>/dev/null || echo "none")
-          echo "cache_fingerprint=${SDK_REV}-${LIBC_REV}-openssl-${OPENSSL_VER}" >> $GITHUB_OUTPUT
+          python3 - <<'PY'
+          from pathlib import Path
 
-      - name: Cache holzschu wasi-sdk and wasi-deps
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            /tmp/wasi-sdk-install
-            /tmp/wasi-deps
-          key: wasi-holzschu-wasip1-${{ runner.os }}-${{ steps.sdk_src.outputs.cache_fingerprint }}
-          restore-keys: |
-            wasi-holzschu-wasip1-${{ runner.os }}-
+          def edit(file, old, new):
+              path = Path(file)
+              text = path.read_text()
+              if text.count(old) != 1:
+                  raise ValueError(f"Unexpected source in {file}: {old[:60]}")
+              path.write_text(text.replace(old, new))
 
-      - name: Build holzschu wasi-sdk toolchain and sysroot
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          cd /tmp/holzschu-wasi-sdk
-          cmake -G Ninja -B build/toolchain -S . \
-            -DWASI_SDK_BUILD_TOOLCHAIN=ON \
-            -DCMAKE_INSTALL_PREFIX="${WASI_SDK_PATH}"
-          cmake --build build/toolchain --target install
+          def replace_section(file, start, end, replacement):
+              text = Path(file).read_text()
+              begin = text.index(start)
+              finish = text.index(end, begin)
+              edit(file, text[begin:finish], replacement)
 
-          cmake -G Ninja -B build/sysroot -S . \
-            -DWASI_SDK_BUILD_TOOLCHAIN=OFF \
-            -DWASI_SDK_TARGETS=wasm32-wasip1 \
-            -DCMAKE_INSTALL_PREFIX="${WASI_SDK_PATH}" \
-            -DWASI_SDK_INSTALL_TO_CLANG_RESOURCE_DIR=ON
-          cmake --build build/sysroot --target install
+          edit("src/zsign.cpp", "#include <sys/wait.h>", "")
+          replace_section("src/zsign.cpp", "static bool InstallSignedIpa", "int usage()", '''static bool InstallSignedIpa(const string&)
+          {
+              ZLog::Error("Installation requires a separate device installer.\\n");
+              return false;
+          }
 
-      - name: Build zlib for wasm32-wasip1
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          curl -sSL "https://zlib.net/current/zlib.tar.gz" | tar -xz -C /tmp
-          cd /tmp/zlib-*
-          CC="${WASI_SDK_PATH}/bin/clang" \
-          AR="${WASI_SDK_PATH}/bin/llvm-ar" \
-          RANLIB="${WASI_SDK_PATH}/bin/llvm-ranlib" \
-          CFLAGS="-O2" \
-          ./configure --static --prefix="${WASI_DEPS_PATH}"
-          make -j"$(nproc)" && make install
+          ''')
+          edit("src/signing.cpp", "#ifndef _WIN32\n\tif (ZFile::IsFileExists", "#if 0 // csreq is an external macOS program\n\tif (ZFile::IsFileExists")
+          replace_section("src/certcheck.cpp", "#ifdef _WIN32", "// --- helpers", "")
+          replace_section("src/certcheck.cpp", "static bool ExtractOCSPUrl", "// --- display", '''static OCSPResult PerformOCSP(X509*, X509*)
+          {
+              return {"Unknown", "", "Online OCSP is unavailable in the offline WASI build"};
+          }
 
-      - name: Build static OpenSSL for wasm32-wasip1
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          curl -sSL "https://www.openssl.org/source/openssl-${OPENSSL_VER}.tar.gz" | tar -xz -C /tmp
-          cd "/tmp/openssl-${OPENSSL_VER}"
-          CC="${WASI_SDK_PATH}/bin/clang" \
-          AR="${WASI_SDK_PATH}/bin/llvm-ar" \
-          RANLIB="${WASI_SDK_PATH}/bin/llvm-ranlib" \
-          ./Configure no-asm no-shared no-threads no-tests no-ui-console no-sock no-dso no-engine \
-            --prefix="${WASI_DEPS_PATH}" \
-            --openssldir="${WASI_DEPS_PATH}/ssl" \
-            linux-generic32 \
-            "-target wasm32-wasip1 --sysroot=${WASI_SDK_PATH}/share/wasi-sysroot -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID"
-          make -j"$(nproc)" build_libs && make install_dev
-
-      - name: Apply WASI shims and patches to zsign
-        run: |
-          mkdir -p "${WASI_SHIMS_PATH}/sys" "${WASI_SHIMS_PATH}/netinet" "${WASI_SHIMS_PATH}/arpa"
-
-          # Stub socket/network headers absent in wasm32-wasip1
-          cat << 'EOF' > "${WASI_SHIMS_PATH}/sys/socket.h"
-          #pragma once
-          #include <sys/types.h>
-          #define AF_INET 2
-          #define AF_INET6 10
-          #define SOCK_STREAM 1
-          #define SOCK_DGRAM 2
-          #define SOL_SOCKET 1
-          #define SO_REUSEADDR 2
-          struct sockaddr { unsigned short sa_family; char sa_data[14]; };
-          typedef unsigned int socklen_t;
-          static inline int socket(int, int, int) { return -1; }
-          static inline int connect(int, const struct sockaddr*, socklen_t) { return -1; }
-          static inline int setsockopt(int, int, int, const void*, socklen_t) { return -1; }
-          EOF
-
-          cat << 'EOF' > "${WASI_SHIMS_PATH}/netinet/in.h"
-          #pragma once
-          #include <stdint.h>
-          #include <sys/socket.h>
-          typedef uint16_t in_port_t;
-          typedef uint32_t in_addr_t;
-          struct in_addr { in_addr_t s_addr; };
-          struct sockaddr_in {
-            unsigned short sin_family;
-            in_port_t sin_port;
-            struct in_addr sin_addr;
-            char sin_zero[8];
+          ''')
+          edit("src/common/common.h", "#include <sys/mman.h>", "")
+          # Keep read-only mappings in memory. Retain writable file handles for writeback.
+          replace_section("src/common/fs.cpp", "void* ZFile::MapFile", "bool ZFile::WriteFile(", '''namespace {
+          struct Mapping {
+              FILE* output;
+              off_t offset;
+              size_t length;
           };
-          static inline uint32_t htonl(uint32_t x) {
-            return ((x & 0xff000000u) >> 24) | ((x & 0x00ff0000u) >> 8) |
-                   ((x & 0x0000ff00u) << 8)  | ((x & 0x000000ffu) << 24);
-          }
-          static inline uint16_t htons(uint16_t x) {
-            return (uint16_t)(((x & 0xff00u) >> 8) | ((x & 0x00ffu) << 8));
-          }
-          static inline uint32_t ntohl(uint32_t x) { return htonl(x); }
-          static inline uint16_t ntohs(uint16_t x) { return htons(x); }
-          EOF
-
-          cat << 'EOF' > "${WASI_SHIMS_PATH}/arpa/inet.h"
-          #pragma once
-          #include <netinet/in.h>
-          static inline const char* inet_ntoa(struct in_addr) { return "0.0.0.0"; }
-          static inline int inet_pton(int, const char*, void*) { return 0; }
-          EOF
-
-          cat << 'EOF' > "${WASI_SHIMS_PATH}/netdb.h"
-          #pragma once
-          #include <netinet/in.h>
-          struct hostent { char* h_name; int h_addrtype; int h_length; char** h_addr_list; };
-          struct addrinfo { int ai_family; int ai_socktype; int ai_protocol; struct sockaddr* ai_addr; struct addrinfo* ai_next; };
-          static inline struct hostent* gethostbyname(const char*) { return 0; }
-          static inline int getaddrinfo(const char*, const char*, const struct addrinfo*, struct addrinfo**) { return -1; }
-          static inline void freeaddrinfo(struct addrinfo*) {}
-          EOF
-
-          # WASI C++ shim providing arc4random / arc4random_uniform
-          cat << 'EOF' > "${WASI_SHIMS_PATH}/wasi_arc4random.hpp"
-          #pragma once
-          #if defined(__wasi__)
-          #include <stdint.h>
-          #include <random>
-
-          extern "C" {
-          static inline uint32_t arc4random(void) {
-            static thread_local std::mt19937 rng([]() {
-              std::random_device rd;
-              return rd();
-            }());
-            return rng();
+          map<void*, Mapping> mappings;
           }
 
-          static inline uint32_t arc4random_uniform(uint32_t upper_bound) {
-            if (upper_bound < 2) return 0;
-            uint32_t min = (uint32_t)(-upper_bound) % upper_bound;
-            for (;;) {
-              uint32_t r = arc4random();
-              if (r >= min) return r % upper_bound;
-            }
+          void* ZFile::MapFile(const char* path, size_t offset, size_t size, size_t* psize, bool ro)
+          {
+              FILE* fp = fopen(path, ro ? "rb" : "r+b");
+              if (!fp) return nullptr;
+              struct stat st{};
+              if (fstat(fileno(fp), &st) || st.st_size < 0 ||
+                  uint64_t(offset) > uint64_t(st.st_size)) {
+                  fclose(fp);
+                  return nullptr;
+              }
+              uint64_t available = uint64_t(st.st_size) - offset;
+              uint64_t wanted = size ? size : available;
+              if (!wanted || wanted > available || wanted > SIZE_MAX ||
+                  fseeko(fp, offset, SEEK_SET)) {
+                  fclose(fp);
+                  return nullptr;
+              }
+              size = static_cast<size_t>(wanted);
+              void* data = malloc(size);
+              if (!data || fread(data, 1, size, fp) != size) {
+                  free(data);
+                  fclose(fp);
+                  return nullptr;
+              }
+              if (ro) fclose(fp);
+              mappings.emplace(data, Mapping{ro ? nullptr : fp, off_t(offset), size});
+              if (psize) *psize = size;
+              return data;
           }
+
+          bool ZFile::UnmapFile(void* data, size_t size)
+          {
+              auto it = mappings.find(data);
+              if (it == mappings.end() || it->second.length != size) return false;
+              const Mapping m = it->second;
+              bool ok = true;
+              if (m.output) {
+                  ok = fseeko(m.output, m.offset, SEEK_SET) == 0 &&
+                       fwrite(data, 1, size, m.output) == size;
+                  if (fclose(m.output) != 0) ok = false;
+              }
+              mappings.erase(it);
+              free(data);
+              return ok;
           }
-          #endif
-          EOF
 
-          # Force-include the arc4random shim in C++ compilation units on WASI
-          # and guard any direct arc4random declarations if present in zsign sources
-          python3 - << 'PY'
-          import pathlib
+          ''')
+          # Upstream inspection paths sometimes destroy a Mach-O without explicitly closing it.
+          # Discard abandoned edits and release the file; only a successful explicit close commits.
+          edit("src/common/fs.h", "static bool\t\tUnmapFile", "static void DiscardMapping(void* data);\n\tstatic bool\t\tUnmapFile")
+          edit("src/common/fs.cpp", "bool ZFile::UnmapFile", '''void ZFile::DiscardMapping(void* data)
+          {
+              auto it = mappings.find(data);
+              if (it == mappings.end()) return;
+              if (it->second.output) fclose(it->second.output);
+              mappings.erase(it);
+              free(data);
+          }
 
-          root = pathlib.Path("zsign/src")
-          for path in root.rglob("*.cpp"):
-              text = path.read_text(encoding="utf-8", errors="ignore")
-              if "arc4random" in text and "wasi_arc4random.hpp" not in text:
-                  path.write_text('#include "wasi_arc4random.hpp"\n' + text, encoding="utf-8")
+          bool ZFile::UnmapFile''')
+          edit("src/macho.cpp", "m_pBase = NULL;\n\tm_sSize = 0;\n\tm_arrArchOes.clear();", "ZFile::DiscardMapping(m_pBase);\n\tm_pBase = NULL;\n\tm_sSize = 0;\n\tm_arrArchOes.clear();")
+          edit("src/macho.cpp", "if (!ZFile::UnmapFile((void*)m_pBase, m_sSize))", "bool ok = ZFile::UnmapFile(m_pBase, m_sSize);\n\tm_pBase = NULL;\n\tif (!ok)")
+          edit("src/macho.cpp", "FreeArchOes();\n\treturn CloseFile();", "bool ok = CloseFile();\n\tFreeArchOes();\n\treturn ok;")
           PY
 
-      - name: Compile zsign.wasm
+      - name: Cross-compile with the upstream makefile and vendored ZIP sources
         run: |
-          cd zsign
-          SRCS=$(find src -name '*.cpp')
-          "${WASI_SDK_PATH}/bin/clang++" \
-            --target=wasm32-wasip1 \
-            --sysroot="${WASI_SDK_PATH}/share/wasi-sysroot" \
-            -std=c++17 -O2 \
-            -include "${WASI_SHIMS_PATH}/wasi_arc4random.hpp" \
-            -Isrc -I"${WASI_SHIMS_PATH}" -I"${WASI_DEPS_PATH}/include" \
-            ${SRCS} \
-            "${WASI_DEPS_PATH}/lib/libssl.a" \
-            "${WASI_DEPS_PATH}/lib/libcrypto.a" \
-            "${WASI_DEPS_PATH}/lib/libz.a" \
-            -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid \
-            -o /tmp/zsign.wasm
+          flags="--target=$TARGET -DMINIZIP_FOPEN_NO_64 -D_WASI_EMULATED_GETPID"
+          libs="$SSL_PREFIX/lib/libssl.a $SSL_PREFIX/lib/libcrypto.a"
+          libs+=" -lwasi-emulated-signal -lwasi-emulated-process-clocks"
+          libs+=" -lwasi-emulated-getpid -lwasi-emulated-mman"
+          make -j"$(nproc)" -C zsign/build/linux \
+            CC="$WASI_SDK_PATH/bin/clang $flags" \
+            CXX="$WASI_SDK_PATH/bin/clang++ $flags -fno-exceptions" \
+            OPENSSL_INCLUDE="-I$SSL_PREFIX/include" OPENSSL_LIB="$libs" \
+            VERSION="${ZSIGN_REV:0:12}"
+          mkdir -p dist
+          cp zsign/bin/zsign dist/zsign.wasm
 
-      - name: Upload zsign.wasm
+      - name: Validate module and exercise signing on a copied fixture
+        run: |
+          node --input-type=commonjs <<'JS'
+          const fs = require('node:fs');
+          const { WASI } = require('node:wasi');
+          const binary = 'dist/zsign.wasm';
+          const load = path => new WebAssembly.Module(fs.readFileSync(path));
+          const signer = load(binary);
+          const rand = load(process.env.RUNNER_TEMP + '/rand-probe.wasm');
+          const imports = WebAssembly.Module.imports(signer);
+          fs.writeFileSync('dist/imports.json', JSON.stringify(imports, null, 2));
+          if (!WebAssembly.Module.exports(signer).some(x => x.name === '_start'))
+            throw Error('Missing WASI command entry point');
+          function run(module, args) {
+            const wasi = new WASI({version:'preview1', args, preopens:{'.':process.cwd()}, returnOnExit:true});
+            const code = wasi.start(new WebAssembly.Instance(module, {wasi_snapshot_preview1:wasi.wasiImport}));
+            if (code !== 0) throw Error(args.join(' ') + ' exited ' + code);
+          }
+          const available = new WASI({version:'preview1'}).wasiImport;
+          const extra = [rand, signer].flatMap(m => WebAssembly.Module.imports(m))
+            .filter(i => i.module !== 'wasi_snapshot_preview1' || typeof available[i.name] !== 'function');
+          let status;
+          if (extra.length) {
+            status = 'Linked and validated. Device runtime test required for imports: ' +
+                     [...new Set(extra.map(i => i.module+'.'+i.name))].join(', ');
+          } else {
+            run(rand, ['rand-probe']);
+            run(signer, ['zsign','-v']);
+            const fixture = 'zsign/test/dylib/bin/demo1.dylib';
+            fs.copyFileSync(fixture, 'smoke.dylib');
+            run(signer, ['zsign','-a','-f','-b','org.example.wasismoke','smoke.dylib']);
+            const signed = fs.readFileSync('smoke.dylib');
+            if (signed.equals(fs.readFileSync(fixture))) throw Error('Signed bytes did not change');
+            if (!signed.includes(Buffer.from('org.example.wasismoke\0'))) throw Error('Missing signing identifier');
+            status = 'WASI entropy, CLI startup, and ad-hoc Mach-O writeback passed under Node.';
+          }
+          console.log(status);
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, status + '\n');
+          fs.writeFileSync('dist/validation.txt', status + '\n');
+          JS
+          if [[ -f smoke.dylib ]]; then
+            python3 - smoke.dylib <<'PY'
+          # Verify each CodeDirectory's executable-page hashes in the arm64 smoke fixture.
+          import hashlib
+          import struct
+          from pathlib import Path
+          import sys
+
+          data = Path(sys.argv[1]).read_bytes()
+          if struct.unpack_from("<I", data)[0] != 0xfeedfacf:
+              raise ValueError("Expected a thin 64-bit Mach-O")
+          offset = 32
+          for _ in range(struct.unpack_from("<I", data, 16)[0]):
+              cmd, size = struct.unpack_from("<II", data, offset)
+              if cmd == 0x1d:
+                  signature, length = struct.unpack_from("<II", data, offset + 8)
+                  break
+              offset += size
+          else:
+              raise ValueError("Missing LC_CODE_SIGNATURE")
+          blob = data[signature:signature + length]
+          magic, _, count = struct.unpack_from(">III", blob)
+          assert magic == 0xfade0cc0
+          checked = 0
+          for index in range(count):
+              _, start = struct.unpack_from(">II", blob, 12 + index * 8)
+              if struct.unpack_from(">I", blob, start)[0] != 0xfade0c02:
+                  continue
+              cdsize = struct.unpack_from(">I", blob, start + 4)[0]
+              cd = blob[start:start + cdsize]
+              hashes, ident, _, slots, limit = struct.unpack_from(">IIIII", cd, 16)
+              width, kind, _, exponent = cd[36:40]
+              algorithm = {1: "sha1", 2: "sha256"}[kind]
+              assert cd[ident:].split(b"\0", 1)[0] == b"org.example.wasismoke"
+              page = 1 << exponent
+              assert 0 < limit <= signature and slots == (limit + page - 1) // page
+              for slot in range(slots):
+                  chunk = data[slot * page:min(limit, (slot + 1) * page)]
+                  digest = hashlib.new(algorithm, chunk).digest()
+                  assert width == len(digest)
+                  assert cd[hashes + slot*width:hashes + (slot+1)*width] == digest
+              checked += 1
+          assert checked, "No CodeDirectory found"
+          print(f"Verified {checked} CodeDirectories against signed file bytes")
+          PY
+          fi
+          cd dist
+          sha256sum zsign.wasm > SHA256SUMS
+
+      - name: Upload a-Shell command and validation results
         uses: actions/upload-artifact@v4
         with:
           name: zsign-wasm-holzschu
-          path: /tmp/zsign.wasm
+          path: dist/
+          if-no-files-found: error
