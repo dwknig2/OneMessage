@@ -2,6 +2,9 @@ name: zsign for a-Shell
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/zsign-a-shell-wasm.yml']
   push:
     branches: [main]
     paths: ['.github/workflows/zsign-a-shell-wasm.yml']
@@ -333,7 +336,42 @@ jobs:
             throw Error('Missing WASI command entry point');
           function run(module, args) {
             const wasi = new WASI({version:'preview1', args, preopens:{'/':process.env.SMOKE_ROOT}, returnOnExit:true});
-            const code = wasi.start(new WebAssembly.Instance(module, {wasi_snapshot_preview1:wasi.wasiImport}));
+            // The pinned a-Shell libc passes AT_FDCWD (-2) and the original path.
+            // Node needs its sole preopened directory (fd 3) and a path relative to it.
+            const host = {...wasi.wasiImport};
+            // The fork enumerates preopens on first close, after opening a file.
+            // The single configured preopen is fd 3. End enumeration with EBADF.
+            host.fd_prestat_get = (fd, out) => fd > 3 ? 8 : wasi.wasiImport.fd_prestat_get(fd, out);
+            let instance;
+            function adapt(name, paths) {
+              host[name] = (...args) => {
+                const memory = new Uint8Array(instance.exports.memory.buffer);
+                for (const [fd, ptr] of paths) {
+                  if (args[fd] !== -2) continue;
+                  args[fd] = 3;
+                  if (args[ptr + 1] && memory[args[ptr]] === 47) {
+                    args[ptr]++;
+                    args[ptr + 1]--;
+                  }
+                }
+                if (name === 'path_open' && args[0] === 3) {
+                  // Only normal fixture files are opened. Intersect the fork's broad
+                  // request with read/write, seek/tell and filestat_get file rights.
+                  const fixtureRights = (1n<<1n)|(1n<<6n)|(1n<<2n)|(1n<<5n)|(1n<<21n);
+                  args[5] &= fixtureRights;
+                  args[6] = 0n;
+                }
+                return wasi.wasiImport[name](...args);
+              };
+            }
+            for (const name of ['path_create_directory', 'path_readlink',
+                                'path_remove_directory', 'path_unlink_file'])
+              adapt(name, [[0, 1]]);
+            adapt('path_filestat_get', [[0, 2]]);
+            adapt('path_open', [[0, 2]]);
+            adapt('path_rename', [[0, 1], [3, 4]]);
+            instance = new WebAssembly.Instance(module, {wasi_snapshot_preview1:host});
+            const code = wasi.start(instance);
             if (code !== 0) throw Error(args.join(' ') + ' exited ' + code);
           }
           const available = new WASI({version:'preview1'}).wasiImport;
@@ -353,7 +391,7 @@ jobs:
             const signed = fs.readFileSync(copy);
             if (signed.equals(fs.readFileSync(fixture))) throw Error('Signed bytes did not change');
             if (!signed.includes(Buffer.from('org.example.wasismoke\0'))) throw Error('Missing signing identifier');
-            status = 'WASI entropy, CLI startup, and ad-hoc Mach-O writeback passed under Node.';
+            status = 'WASI entropy, CLI startup, and ad-hoc Mach-O writeback passed under Node with a-Shell path translation.';
           }
           console.log(status);
           fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, status + '\n');
